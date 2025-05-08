@@ -2,13 +2,17 @@ from typing import Mapping, Optional, Iterator, Any
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
+from torch.optim import lr_scheduler
 from datetime import datetime as dt
 from tqdm.notebook import tqdm
 
 from .dataset import *
 args = {
-    "fp16" : False,
-    "profiler" : True
+    "fp16" : True,
+    "profiler" : True,
+    "gradAcc" : True,
+    "gradAccIter": 4,
+    "lr_scheduler" : True,
 }
 
 class Trainer(nn.Module):
@@ -39,7 +43,7 @@ class Trainer(nn.Module):
         self.loss_fn = loss_fn
         self.device = device
 
-    def train(self, dataloader: DataLoader, *, epochs: int = 100) -> None:
+    def train(self, dataloader: DataLoader, *, epochs: int = 100, silent: bool = False) -> None:
         """Trains the model for a specified number of epochs.
 
         Args:
@@ -47,10 +51,10 @@ class Trainer(nn.Module):
             epochs (int, optional): Number of training epochs. Defaults to 100.
             silent (bool, optional): If True, suppresses printing loss during training. Defaults to False.
         """
-        for _ in self.train_iter(dataloader, epochs=epochs):
+        for _ in self.train_iter(dataloader, epochs=epochs, silent=silent):
             pass
 
-    def train_iter(self, dataloader: DataLoader, *, epochs: int = 100) -> Iterator[nn.Module]:
+    def train_iter(self, dataloader: DataLoader, *, epochs: int = 100, silent: bool = False) -> Iterator[nn.Module]:
         """Trains the model for a specified number of epochs and yields the model after each epoch.
 
         Args:
@@ -64,6 +68,10 @@ class Trainer(nn.Module):
         model = self.model.to(self.device)
         self._optimizer_to(self.optimizer, self.device)
 
+        scheduler = None
+        if args["lr_scheduling"]:
+            scheduler = lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.1)
+
         if args["fp16"]:
             scaler = torch.amp.GradScaler()
         
@@ -72,8 +80,8 @@ class Trainer(nn.Module):
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             schedule=torch.profiler.schedule(wait=0, warmup=3, active=100, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/trainer_profile'),
-            # record_shapes=True,
-            # profile_memory=True,
+            record_shapes=True,
+            profile_memory=True,
             # with_stack=True,
             # with_flops=True,
             # with_modules=True
@@ -92,19 +100,38 @@ class Trainer(nn.Module):
                         x = model(x)
                 else:
                     x = model(x)
-
-                loss = self.loss_fn(x, y)
-
-                if args["fp16"]:
-                    scaler.scale(loss).backward()
-                    scaler.step(self.optimizer)
-                    scaler.update()
+                if args["gradAcc"]:
+                    loss = self.loss_fn(x,y)/args["gradAccIter"]
                 else:
-                    loss.backward()
-                    self.optimizer.step()
+                    loss = self.loss_fn(x, y)
+
+                if args["gradAcc"]:
+                    if args["fp16"]:
+                        scaler.scale(loss).backward()
+                        if ((i + 1) % args["gradAccIter"] == 0) or (i + 1 == len(dataloader)):
+                            scaler.step(self.optimizer)
+                            scaler.update()
+                            self.optimizer.zero_grad()
+                    else:
+                        loss.backward()
+                        if ((i + 1) % args["gradAccIter"] == 0) or (i + 1 == len(dataloader)):
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                else:
+                    if args["fp16"]:
+                        scaler.scale(loss).backward()
+                        scaler.step(self.optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        self.optimizer.step()
                 if args["profiler"]:
                     prof.step()
+                    
             yield model
+
+            if scheduler is not None:
+                scheduler.step()
         
         if args["profiler"]:
             prof.stop()
